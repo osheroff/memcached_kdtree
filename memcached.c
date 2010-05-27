@@ -47,6 +47,8 @@
 #include <sysexits.h>
 #include <stddef.h>
 
+#include "kdtree.h"
+
 /* FreeBSD 4.x doesn't have IOV_MAX exposed. */
 #ifndef IOV_MAX
 #if defined(__FreeBSD__) || defined(__APPLE__)
@@ -2094,6 +2096,34 @@ static void complete_nread(conn *c) {
     }
 }
 
+item *do_parse_geo(item *geo, item *it);
+item *do_parse_geo(item *geo, item *it)
+{
+	char *data, *p;
+	kd_data_destructor(geo->kdtree, free);
+
+	/* just hammer the data item, we're going to throw it out anyway */
+	*ITEM_suffix(it) = '\0';	
+
+	p = data = ITEM_data(it);
+	while ( (p = strstr(data, "\r\n") ) ) { 
+		double points[2];
+		char key[2048];
+		
+		*p = '\0';
+		if ( sscanf(data, "%lf\t%lf\t%2047s", &points[0], &points[1], (char *)&key) != 3 ) {
+			return NULL;
+		}
+	
+		kd_insert(geo->kdtree, points, strdup(key));	
+		data = p + 2;
+	}	
+
+	/* keep the tree at the head of the LRU */	
+	// item_update(geo);
+	return geo;	
+}
+
 /*
  * Stores an item in the cache according to the semantics of one of the set
  * commands. In threaded mode, this is protected by the cache lock.
@@ -2146,6 +2176,11 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
             }
             stored = EXISTS;
         }
+    } else if ( comm == NREAD_SETGEO ) {
+        if (do_parse_geo(old_it, it)) 
+		return STORED;
+	else	
+		return -1;
     } else {
         /*
          * Append - combine new and old record into single one. Here it's
@@ -2518,6 +2553,145 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     }
 }
 
+static void process_init_geo_command(conn *c, token_t *tokens, const size_t ntokens)
+{
+    char *key;
+    size_t nkey;
+    item *it, *old_it;
+
+
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+    
+    assert(c != NULL);
+
+    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+   
+    it = item_alloc(key, nkey, 0, 0, strlen("(geo data)") +2);
+    strcpy(ITEM_data(it), "(geo data)\r\n");
+
+    if (it == 0) {
+      out_string(c, "SERVER_ERROR out of memory");
+      return;
+    }
+
+    it->kdtree = kd_create(2);
+    if (it->kdtree == 0) {
+      out_string(c, "SERVER_ERROR out of memory");
+      return;
+    }
+    old_it = do_item_get_nocheck(key, it->nkey);
+
+    if (old_it != NULL)
+      do_item_replace(old_it, it);
+    else
+      do_item_link(it);
+
+    if ( old_it ) 
+      do_item_remove(old_it);
+
+    do_item_remove(it);
+    out_string(c, "STORED");
+}
+
+
+
+/* ntokens is overwritten here... shrug.. */
+static inline void process_get_geo_command(conn *c, token_t *tokens, size_t ntokens) {
+    struct kdtree *kdtree;
+    struct kdres *kd_set;
+    double pos[2];
+    double radius;
+	int max_results;
+    int i = 0;
+    item *it;
+    token_t *key_token = &tokens[KEY_TOKEN];
+
+    if ( ntokens >= 6 && tokens[5].value ) 
+        max_results = atoi(tokens[5].value);
+    else
+        max_results = -1;
+
+    pos[0] = atof(tokens[2].value);
+    pos[1] = atof(tokens[3].value);
+    radius = atof(tokens[4].value);
+
+    assert(c != NULL);
+
+	/* lookup the kdtree */
+	it = item_get(key_token->value, key_token->length);
+	if ( it && it->kdtree ) {
+		kdtree = it->kdtree;
+		if ( kdtree ) {
+
+			kd_set = kd_nearest_range_geo(kdtree, pos[0], pos[1], radius, max_results);
+			if ( kd_res_size(kd_set) != 0 ) {				
+				do {
+					char *key = kd_res_item(kd_set, NULL);
+					it = item_get(key, strlen(key));
+					if ( it ) {
+						if (i >= c->isize) {
+							item **new_list = realloc(c->ilist, sizeof(item *) * c->isize * 2);
+							if (new_list) {
+								c->isize *= 2;
+								c->ilist = new_list;
+							} else break;
+						}
+
+						/*
+						 * Construct the response. Each hit adds three elements to the
+						 * outgoing data list:
+						 *   "VALUE "
+						 *   key
+						 *   " " + flags + " " + data length + "\r\n" + data (with \r\n)
+						 */
+						if (add_iov(c, "VALUE ", 6) != 0 ||
+							add_iov(c, ITEM_key(it), it->nkey) != 0 ||
+							add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
+                        {
+                            break;
+                        }
+						if (settings.verbose > 1)
+							fprintf(stderr, ">%d sending key %s\n", c->sfd, ITEM_key(it));
+
+						/* item_get() has incremented it->refcount for us */
+						STATS_LOCK();
+						stats.get_hits++;
+						STATS_UNLOCK();
+						item_update(it);
+						*(c->ilist + i) = it;
+						i++;
+					}
+				} while (kd_res_next(kd_set));
+			}
+		
+			kd_res_free(kd_set);
+		}
+	}	
+				
+    c->icurr = c->ilist;
+    c->ileft = i;
+
+    if (settings.verbose > 1)
+        fprintf(stderr, ">%d END\n", c->sfd);
+    add_iov(c, "END\r\n", 5);
+
+    if (IS_UDP(c->transport) && build_udp_headers(c) != 0) {
+        out_string(c, "SERVER_ERROR out of memory");
+    }
+    else {
+        conn_set_state(c, conn_mwrite);
+        c->msgcurr = 0;
+    }
+    return;
+}
+
 /* ntokens is overwritten here... shrug.. */
 static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
     char *key;
@@ -2724,6 +2898,21 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     if (settings.detail_enabled) {
         stats_prefix_record_set(key, nkey);
     }
+    
+    if ( comm == NREAD_SETGEO ) {
+        /* make sure the geo item exists. we'll still use a temp item for buffering the data, though.*/
+        it = item_get(key, nkey);
+        if ( !it ) {
+           out_string(c, "ERROR no such key");
+           goto swallow;
+        }
+ 
+        if ( !it->kdtree ) {
+           out_string(c, "ERROR key not a geo record");
+           goto swallow;
+        }
+        do_item_remove(it); /* release reference */
+    }
 
     it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
 
@@ -2755,6 +2944,14 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     c->rlbytes = it->nbytes;
     c->cmd = comm;
     conn_set_state(c, conn_nread);
+	return;
+
+swallow:
+	/* swallow the data line */
+	c->write_and_go = conn_swallow;
+	c->sbytes = vlen + 2;
+	return;
+	
 }
 
 static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
@@ -2974,12 +3171,18 @@ static void process_command(conn *c, char *command) {
 
         process_get_command(c, tokens, ntokens, false);
 
+    } else if (ntokens >= 6 && 
+        (strcmp(tokens[COMMAND_TOKEN].value, "get_geo") == 0)) {
+           process_get_geo_command(c, tokens, ntokens);
+    } else if (ntokens == 3 && strcmp(tokens[COMMAND_TOKEN].value, "init_geo") == 0) {
+           process_init_geo_command(c, tokens, ntokens);
     } else if ((ntokens == 6 || ntokens == 7) &&
                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
+                (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) ||
+                (strcmp(tokens[COMMAND_TOKEN].value, "set_geo") == 0 && (comm = NREAD_SETGEO)) )) {
 
         process_update_command(c, tokens, ntokens, comm, false);
 

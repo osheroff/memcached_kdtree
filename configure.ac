@@ -283,12 +283,14 @@ if test $ac_cv_libevent_dir != "(system)"; then
   fi
 fi
 
+
 dnl ----------------------------------------------------------------------------
 
 AC_SEARCH_LIBS(socket, socket)
 AC_SEARCH_LIBS(gethostbyname, nsl)
 AC_SEARCH_LIBS(umem_cache_create, umem)
 AC_SEARCH_LIBS(gethugepagesizes, hugetlbfs)
+AC_SEARCH_LIBS(sin, m)
 
 AC_HEADER_STDBOOL
 AH_BOTTOM([#if HAVE_STDBOOL_H

@@ -23,6 +23,8 @@
 
 #include "sasl_defs.h"
 
+#include "kdtree.h"
+
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
 
@@ -181,6 +183,7 @@ enum network_transport {
 #define NREAD_APPEND 4
 #define NREAD_PREPEND 5
 #define NREAD_CAS 6
+#define NREAD_SETGEO 7
 
 enum store_item_type {
     NOT_STORED=0, STORED, EXISTS, NOT_FOUND
@@ -301,6 +304,7 @@ typedef struct _stritem {
     uint8_t         nsuffix;    /* length of flags-and-length string */
     uint8_t         it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
+    struct kdtree *kdtree;
     uint8_t         nkey;       /* key length, w/terminating null and padding */
     void * end[];
     /* if it_flags & ITEM_CAS we have 8 bytes CAS */

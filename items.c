@@ -208,6 +208,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     it->it_flags = settings.use_cas ? ITEM_CAS : 0;
     it->nkey = nkey;
     it->nbytes = nbytes;
+    it->kdtree = NULL;
     memcpy(ITEM_key(it), key, nkey);
     it->exptime = exptime;
     memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
@@ -228,6 +229,11 @@ void item_free(item *it) {
     it->slabs_clsid = 0;
     it->it_flags |= ITEM_SLABBED;
     DEBUG_REFCNT(it, 'F');
+    if ( it->kdtree ) {
+        kd_free(it->kdtree);
+        it->kdtree = 0;
+    }
+    
     slabs_free(it, ntotal, clsid);
 }
 
